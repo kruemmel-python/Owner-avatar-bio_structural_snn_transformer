@@ -124,12 +124,16 @@ def _ensure_state() -> None:
 def _create_adapter(metric_queue: queue.Queue) -> InstrumentedBookAdapter:
     # Initialisiere den Tokenizer und das Transformer-Modell
     tokenizer = Tokenizer()
+    # Für die Streamlit-Oberfläche nutzen wir eine kompakte Konfiguration,
+    # damit Trainings- und Exportvorgänge den verfügbaren Arbeitsspeicher
+    # nicht überlasten. Die Parameter orientieren sich an der leichten
+    # CLI-Variante des Modells.
     model = TransformerCore(
         vocab_size=tokenizer.vocab_size, # Vokabulargröße vom Tokenizer
-        d_model=768,
-        num_heads=12,
-        num_layers=12,
-        d_ff=3072,
+        d_model=128,
+        num_heads=4,
+        num_layers=2,
+        d_ff=512,
         max_seq_len=512,
         dropout=0.1
     ).to(st.session_state.device) # Modell auf das Gerät verschieben
