@@ -229,6 +229,27 @@ class InstrumentedBookAdapter:  # Nicht mehr von adapter_plus.BookAdapter erben
             except (AttributeError, ValueError):
                 pass
 
+        for attr in ("max_len_single_sentence", "max_len_sentences_pair"):
+            existing = getattr(hf_tokenizer, attr, None)
+            if isinstance(existing, int) and existing < target_max_length:
+                try:
+                    setattr(hf_tokenizer, attr, target_max_length)
+                except (AttributeError, ValueError):
+                    pass
+
+        max_input_sizes = getattr(hf_tokenizer, "max_model_input_sizes", None)
+        if isinstance(max_input_sizes, dict):
+            updated = False
+            for key, value in list(max_input_sizes.items()):
+                if isinstance(value, int) and value < target_max_length:
+                    max_input_sizes[key] = target_max_length
+                    updated = True
+            if updated:
+                try:
+                    hf_tokenizer.max_model_input_sizes = dict(max_input_sizes)
+                except Exception:
+                    pass
+
         # Einige Tokenizer lesen den Wert zusätzlich aus init_kwargs aus.
         init_kwargs = getattr(hf_tokenizer, "init_kwargs", None)
         if isinstance(init_kwargs, dict):

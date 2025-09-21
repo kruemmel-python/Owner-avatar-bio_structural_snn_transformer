@@ -356,19 +356,27 @@ def _render_persistence() -> None:
     with st.expander("💾 Modell speichern & laden", expanded=True):
         st.subheader("Aktuellen Zustand sichern")
         if adapter:
-            try:
-                model_bytes = adapter.export_model_state()
-            except Exception as exc:  # pragma: no cover - Schutz vor Serialisierungsfehlern
-                st.error(f"Export fehlgeschlagen: {exc}")
+            if state.training_running:
+                st.info("Training läuft – Export wird nach Abschluss wieder aktiviert.")
+                model_bytes: bytes | None = None
+            else:
                 model_bytes = None
-            if model_bytes:
-                st.download_button(
-                    "🧠 Modell herunterladen",
-                    data=model_bytes,
-                    file_name="transformer_model.pth",
-                    mime="application/octet-stream",
-                )
-            st.caption("Enthält den Zustand des Transformer-Modells, des Optimierers, des Tokenizers und Metriken.")
+                try:
+                    model_bytes = adapter.export_model_state()
+                except Exception as exc:  # pragma: no cover - Schutz vor Serialisierungsfehlern
+                    st.error(f"Export fehlgeschlagen: {exc}")
+                if model_bytes:
+                    st.download_button(
+                        "🧠 Modell herunterladen",
+                        data=model_bytes,
+                        file_name="transformer_model.pth",
+                        mime="application/octet-stream",
+                    )
+                else:
+                    st.caption("Noch kein exportierbarer Zustand verfügbar.")
+            st.caption(
+                "Enthält den Zustand des Transformer-Modells, des Optimierers, des Tokenizers und Metriken."
+            )
         else:
             st.info("Noch kein trainiertes Modell vorhanden.")
 
