@@ -191,6 +191,34 @@ class InstrumentedBookAdapter:  # Nicht mehr von adapter_plus.BookAdapter erben
         self._metric_callbacks: List[Callable[[Dict[str, float]], None]] = []
         self.ingested_text_data: List[List[int]] = []  # Tokenisierte Daten
 
+        # Tokenizer warnen bei sehr langen Sequenzen mit einem Hinweis, dass das
+        # Modell maximal ``model_max_length`` Tokens gleichzeitig verarbeiten
+        # könne. Für das Training zerschneiden wir die Tokens aber später
+        # ohnehin in handliche Blöcke. Damit der Hinweis nicht jedes Mal
+        # erscheint (obwohl wir ihn sicher beherrschen), erhöhen wir das Limit
+        # auf einen konservativen, aber großzügigen Wert.
+        try:
+            context_window = self.transformer_core.pos_encoder.pe.size(0)
+        except AttributeError:
+            context_window = 0
+
+        scaled_window = int(context_window) * 64 if context_window else 0
+        target_max_length = max(scaled_window, 1_000_000)
+
+        current_max_length = getattr(self.tokenizer, "model_max_length", None)
+        if isinstance(current_max_length, int):
+            if current_max_length < target_max_length:
+                try:
+                    self.tokenizer.model_max_length = target_max_length
+                except (AttributeError, ValueError):
+                    pass
+        # Einige Tokenizer lesen den Wert zusätzlich aus init_kwargs aus.
+        init_kwargs = getattr(self.tokenizer, "init_kwargs", None)
+        if isinstance(init_kwargs, dict):
+            existing = init_kwargs.get("model_max_length")
+            if not isinstance(existing, int) or existing < target_max_length:
+                init_kwargs["model_max_length"] = target_max_length
+
         # Initialisiere den Trainer mit allen erforderlichen Parametern
         self.trainer = tc.TransformerTrainer(
             model=transformer_core,
