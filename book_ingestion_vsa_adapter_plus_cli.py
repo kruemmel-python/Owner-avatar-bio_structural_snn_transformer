@@ -198,9 +198,20 @@ class InstrumentedBookAdapter:  # Nicht mehr von adapter_plus.BookAdapter erben
         # erscheint (obwohl wir ihn sicher beherrschen), erhöhen wir das Limit
         # auf einen konservativen, aber großzügigen Wert.
         try:
-            context_window = self.transformer_core.pos_encoder.pe.size(0)
+            context_window = int(self.transformer_core.pos_encoder.pe.size(0))
         except AttributeError:
             context_window = 0
+
+        # Optional Obergrenze, damit importierte Modelle mit sehr großen
+        # Kontextfenstern die Streamlit-Oberfläche nicht durch riesige
+        # Attention-Masken lahmlegen. Kann über ``max_context_window``
+        # überschrieben werden.
+        raw_limit = kwargs.pop("max_context_window", None)
+        if isinstance(raw_limit, int) and raw_limit > 0:
+            self._context_window_limit: Optional[int] = raw_limit
+        else:
+            # 4k Tokens halten das Masken-Quadrat bei ~64 MB in float32.
+            self._context_window_limit = 4096
 
         scaled_window = int(context_window) * 64 if context_window else 0
         target_max_length = max(scaled_window, 1_000_000)
@@ -269,6 +280,22 @@ class InstrumentedBookAdapter:  # Nicht mehr von adapter_plus.BookAdapter erben
                     # externe Konsumenten sollen das Logging nicht blockieren
                     pass
 
+    def _effective_context_window(self) -> int:
+        """Ermittelt die beim Training zu nutzende Kontextlänge."""
+
+        try:
+            model_window = int(self.transformer_core.pos_encoder.pe.size(0))
+        except Exception:
+            model_window = 0
+
+        if model_window <= 0:
+            model_window = 512  # konservativer Fallback
+
+        if self._context_window_limit is not None:
+            model_window = min(model_window, self._context_window_limit)
+
+        return max(model_window, 1)
+
     def ingest_book(
         self,
         text: str,
@@ -305,7 +332,7 @@ class InstrumentedBookAdapter:  # Nicht mehr von adapter_plus.BookAdapter erben
         if len(tokens) < 2:
             return None
 
-        max_len = min(len(tokens) - 1, self.transformer_core.pos_encoder.pe.size(0))
+        max_len = min(len(tokens) - 1, self._effective_context_window())
         pad_id = self.tokenizer.pad_token_id
 
         inputs: List[List[int]] = []
@@ -364,7 +391,11 @@ class InstrumentedBookAdapter:  # Nicht mehr von adapter_plus.BookAdapter erben
         print(f"Starte Training für {epochs} Epochen...")
         for epoch in range(epochs):
             print(f"Epoche {epoch + 1}/{epochs}")
+            context_window = self._effective_context_window()
             for batch_idx, (input_ids, target_ids) in enumerate(data_loader, start=1):
+                if input_ids.size(1) > context_window:
+                    input_ids = input_ids[:, :context_window].contiguous()
+                    target_ids = target_ids[:, :context_window].contiguous()
                 loss = self.trainer.train_step(input_ids, target_ids)
 
                 with torch.no_grad():
