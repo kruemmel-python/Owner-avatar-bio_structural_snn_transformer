@@ -11,12 +11,16 @@ from __future__ import annotations
 import argparse
 import csv
 import io
+import math
 import os
 import pickle
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Tuple, Optional
+from typing import Callable, Dict, List, Optional, Tuple
+
+import torch
+from torch.utils.data import DataLoader, TensorDataset
 
 # >>> Angepasste Imports für Transformer-Architektur
 import transformer_core as tc # Das neue Transformer-Modul
@@ -142,29 +146,58 @@ class MetricsLogger:
 # 2) Instrumentierter Adapter (wrappt den „Plus“-Adapter und Transformer)
 # ==============================
 
-class InstrumentedBookAdapter: # Nicht mehr von adapter_plus.BookAdapter erben
+class InstrumentedBookAdapter:  # Nicht mehr von adapter_plus.BookAdapter erben
     def __init__(
         self,
-        transformer_core: tc.TransformerCore,
-        tokenizer: tc.Tokenizer,
-        optimizer: Optional[tc.torch.optim.Optimizer] = None,
-        criterion: Optional[tc.torch.nn.Module] = None,
-        device: Optional[tc.torch.device] = None
-    ):
+        transformer_core: Optional[tc.TransformerCore] = None,
+        tokenizer: Optional[tc.Tokenizer] = None,
+        optimizer: Optional[torch.optim.Optimizer] = None,
+        criterion: Optional[torch.nn.Module] = None,
+        device: Optional[torch.device] = None,
+        **kwargs: object,
+    ) -> None:
+        """Instrumentierter Adapter für den Transformer-Trainer.
+
+        Die ursprüngliche CLI rief den Adapter mit den Positionsargumenten
+        ``transformer_core`` und ``tokenizer`` auf.  Die Streamlit-Oberfläche
+        übergibt hingegen Schlüsselwörter wie ``model`` und ``tokenizer``.
+        Um beide Varianten zu unterstützen, akzeptiert der Konstruktor
+        optionale Schlüsselwörter und normalisiert sie auf die erwarteten
+        Attribute.
+        """
+
+        if transformer_core is None:
+            transformer_core = kwargs.pop("model", None)
+        if tokenizer is None:
+            tokenizer = kwargs.get("tokenizer")  # Streamlit übergibt diesen Namen bereits
+        if transformer_core is None or tokenizer is None:
+            raise ValueError("InstrumentedBookAdapter benötigt ein Transformer-Modell und einen Tokenizer.")
+
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        if optimizer is None:
+            optimizer = torch.optim.Adam(transformer_core.parameters(), lr=1e-4)
+        if criterion is None:
+            criterion = torch.nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+
         self.transformer_core = transformer_core
+        # Alias für Kompatibilität mit der Streamlit-Oberfläche
+        self.model = transformer_core
         self.tokenizer = tokenizer
+        self.device = device
         self.metrics = MetricsLogger()
         self._step_counter = 0
         self._metric_callbacks: List[Callable[[Dict[str, float]], None]] = []
-        self.ingested_text_data: List[List[int]] = [] # Tokenisierte Daten
+        self.ingested_text_data: List[List[int]] = []  # Tokenisierte Daten
 
         # Initialisiere den Trainer mit allen erforderlichen Parametern
         self.trainer = tc.TransformerTrainer(
             model=transformer_core,
-            optimizer=optimizer, # Kann None sein, Trainer initialisiert Standard, wenn nicht gegeben
-            criterion=criterion, # Kann None sein, Trainer initialisiert Standard, wenn nicht gegeben
-            device=device,       # Kann None sein, Trainer wählt Standard, wenn nicht gegeben
-            tokenizer=tokenizer  # Tokenizer ist für Metriken im Trainer nützlich
+            optimizer=optimizer,
+            criterion=criterion,
+            device=device,
+            tokenizer=tokenizer,
         )
 
     def add_metric_callback(self, cb: Callable[[Dict[str, float]], None]) -> None:
@@ -197,7 +230,7 @@ class InstrumentedBookAdapter: # Nicht mehr von adapter_plus.BookAdapter erben
     def ingest_book(
         self,
         text: str,
-        chapter_size_sents: int = 40, # Diese Parameter werden für die Tokenisierung verwendet
+        chapter_size_sents: int = 40,
         para_size_sents: int = 6,
         *,
         reset_state: bool = True,
@@ -206,51 +239,141 @@ class InstrumentedBookAdapter: # Nicht mehr von adapter_plus.BookAdapter erben
             self.metrics = MetricsLogger()
             self._step_counter = 0
             self.ingested_text_data = []
-            self.trainer.reset_optimizer() # Auch den Optimierer zurücksetzen
+            self.trainer.reset_optimizer()
 
         print("-> Tokenisiere Buch...")
-        # Hier wird der Text in eine Liste von Token-IDs umgewandelt.
-        # Der `adapter_plus` könnte hier für die Segmentierung in Sätze/Absätze helfen,
-        # bevor der Tokenizer des Transformers angewendet wird.
-        # Für eine einfache Implementierung: gesamter Text wird tokenisiert.
-        token_ids = self.tokenizer.encode(text)
-        self.ingested_text_data.append(token_ids) # Speichern der tokenisierten Daten
+        token_tensor = self.tokenizer.encode(
+            text,
+            max_length=None,
+            truncation=False,
+            padding="do_not_pad",
+        )
+        token_ids = token_tensor.squeeze(0).tolist()
+        self.ingested_text_data.append(token_ids)
 
         # Anfangslog (mit 0-Werten, da noch kein Training)
-        self._log_now(0.0, 0.0, 0.0, 0.0)
+        self._log_now(0.0, 0.0, 0.0, self.trainer.optimizer.param_groups[0]["lr"])
         print(f"Ingestion fertig. Token: {len(token_ids)}")
 
-    def train_on_ingested_data(self, epochs: int = 1, batch_size: int = 4, learning_rate: float = 1e-4):
-        """Trainiert das Transformer-Modell auf den ingestierten Daten."""
+    def _prepare_training_dataset(self) -> Optional[TensorDataset]:
         if not self.ingested_text_data:
+            return None
+
+        tokens = [token for sequence in self.ingested_text_data for token in sequence]
+        if len(tokens) < 2:
+            return None
+
+        max_len = min(len(tokens) - 1, self.transformer_core.pos_encoder.pe.size(0))
+        pad_id = self.tokenizer.pad_token_id
+
+        inputs: List[List[int]] = []
+        targets: List[List[int]] = []
+
+        stride = max_len
+        for start in range(0, len(tokens) - 1, stride):
+            chunk = tokens[start : start + max_len + 1]
+            if len(chunk) < 2:
+                continue
+            input_seq = chunk[:-1]
+            target_seq = chunk[1:]
+
+            if len(input_seq) < max_len:
+                pad_amount = max_len - len(input_seq)
+                input_seq += [pad_id] * pad_amount
+                target_seq += [pad_id] * pad_amount
+
+            inputs.append(input_seq[:max_len])
+            targets.append(target_seq[:max_len])
+
+        if not inputs:
+            return None
+
+        input_tensor = torch.tensor(inputs, dtype=torch.long)
+        target_tensor = torch.tensor(targets, dtype=torch.long)
+        return TensorDataset(input_tensor, target_tensor)
+
+    def train_on_ingested_data(
+        self,
+        text: Optional[str] = None,
+        *,
+        epochs: int = 1,
+        batch_size: int = 4,
+        learning_rate: float = 1e-4,
+        reset_optimizer: bool = True,
+    ) -> None:
+        """Trainiert das Transformer-Modell auf den ingestierten Daten."""
+
+        if text is not None:
+            self.ingest_book(text, reset_state=reset_optimizer)
+
+        dataset = self._prepare_training_dataset()
+        if dataset is None:
             print("Keine Daten zum Trainieren vorhanden. Bitte zuerst ein Buch ingestieren.")
             return
 
-        print(f"Starte Training für {epochs} Epochen...")
-        all_token_ids = [token for sublist in self.ingested_text_data for token in sublist]
-        
-        # Setze die Trainingsdaten im Trainer
-        self.trainer.set_training_data(all_token_ids)
-        self.trainer.set_learning_rate(learning_rate)
+        if reset_optimizer:
+            self.trainer.reset_optimizer(learning_rate)
+        else:
+            self.trainer.set_learning_rate(learning_rate)
 
+        data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        self.trainer.set_training_data(data_loader)
+
+        print(f"Starte Training für {epochs} Epochen...")
         for epoch in range(epochs):
-            print(f"Epoche {epoch+1}/{epochs}")
-            # Der Trainer kümmert sich um Batches und den Trainingsschritt
-            for loss, ppl, acc, lr in self.trainer.train_epoch(batch_size):
+            print(f"Epoche {epoch + 1}/{epochs}")
+            for batch_idx, (input_ids, target_ids) in enumerate(data_loader, start=1):
+                loss = self.trainer.train_step(input_ids, target_ids)
+
+                with torch.no_grad():
+                    input_device = input_ids.to(self.device)
+                    target_device = target_ids.to(self.device)
+                    logits = self.transformer_core(input_device)
+                    predictions = logits.argmax(dim=-1)
+                    mask = target_device != self.tokenizer.pad_token_id
+                    if mask.any():
+                        correct = (predictions == target_device) & mask
+                        accuracy = correct.float().sum().item() / mask.float().sum().item()
+                    else:
+                        accuracy = 0.0
+
+                perplexity = math.exp(loss) if loss < 20 else float("inf")
+                current_lr = self.trainer.optimizer.param_groups[0]["lr"]
+
                 self._step_counter += 1
-                self._log_now(loss, ppl, acc, lr)
+                self._log_now(loss, perplexity, accuracy, current_lr)
+
                 if self._step_counter % 10 == 0:
-                    print(f"  Schritt {self._step_counter}: Loss={loss:.4f}, PPL={ppl:.2f}, Acc={acc:.2f}")
+                    print(
+                        f"  Schritt {self._step_counter}: Loss={loss:.4f}, PPL={perplexity:.2f}, Acc={accuracy:.2f}, LR={current_lr:.6f}"
+                    )
+
         print("Training abgeschlossen.")
 
-    def generate_text(self, prompt: str, max_length: int = 50) -> str:
+    def generate_text(self, prompt: str, max_length: int = 50, temperature: float = 1.0) -> str:
         """Generiert Text basierend auf einem Prompt."""
         print(f"Generiere Text mit Prompt: '{prompt}'...")
-        input_ids = self.tokenizer.encode(prompt)
-        generated_ids = self.transformer_core.generate(input_ids, max_length=max_length)
-        generated_text = self.tokenizer.decode(generated_ids)
-        
+        if not prompt:
+            return ""
+
+        prompt_ids = self.tokenizer.encode(
+            prompt,
+            max_length=self.transformer_core.pos_encoder.pe.size(0),
+            truncation=True,
+            padding="do_not_pad",
+        ).to(self.device)
+
+        generated_ids = self.trainer.generate_text(prompt_ids, max_new_tokens=max_length, temperature=temperature)
+        generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+
         return generated_text
+
+    # Kompatibilitätsalias für die Streamlit-App
+    def export_model_state(self) -> bytes:
+        return self.export_brain_state()
+
+    def import_model_state(self, data: bytes) -> None:
+        self.import_brain_state(data)
 
     def export_brain_state(self) -> bytes:
         # Speichern des Transformer-Modells, des Optimierers und des Tokenizers
@@ -268,35 +391,34 @@ class InstrumentedBookAdapter: # Nicht mehr von adapter_plus.BookAdapter erben
         payload = pickle.loads(data)
         if not isinstance(payload, dict):
             raise ValueError("Ungültiges Gehirnformat: Erwartet Wörterbuch.")
-        
+
         # Laden des Transformer-Modells
         self.transformer_core.load_state_dict(payload.pop("transformer_state_dict", {}))
-        
+        self.model = self.transformer_core
+        self.transformer_core.to(self.device)
+
         # Laden des Optimierers
         optimizer_state_dict = payload.pop("optimizer_state_dict", None)
         if optimizer_state_dict:
-            # Der Trainer muss den Optimierer neu initialisieren, bevor er den Zustand lädt
-            # oder der Optimierer muss direkt im Trainer gesetzt werden.
-            # Hier wird angenommen, dass der Trainer eine Methode zum Laden des Optimiererzustands hat.
-            # Alternativ könnte der Optimierer hier neu erstellt und dann geladen werden.
-            # Da der Trainer den Optimierer verwaltet, rufen wir seine Methode auf.
-            self.trainer.load_optimizer_state_dict(optimizer_state_dict)
-        
+            self.trainer.reset_optimizer(self.trainer.learning_rate)
+            self.trainer.optimizer.load_state_dict(optimizer_state_dict)
+
         # Laden des Tokenizers (ggf. neu initialisieren)
         tokenizer_name = payload.pop("tokenizer_name", None)
         if tokenizer_name:
             # Annahme: Tokenizer kann mit einem Namen neu initialisiert werden
-            self.tokenizer = tc.Tokenizer(tokenizer_name=tokenizer_name)
+            self.tokenizer = tc.Tokenizer(pretrained_model_name_or_path=tokenizer_name)
             # Aktualisiere den Tokenizer im Trainer, falls dieser ihn auch hält
             self.trainer.tokenizer = self.tokenizer
-        
+
         self.metrics = payload.pop("metrics", MetricsLogger())
         self._step_counter = int(payload.pop("step_counter", 0))
         self.ingested_text_data = payload.pop("ingested_text_data", [])
 
         # Falls importierte Metriken leer sind, aktuellen Zustand loggen, damit UI Werte hat.
         if not self.metrics.steps:
-            self._log_now(0.0, 0.0, 0.0, 0.0)
+            current_lr = self.trainer.optimizer.param_groups[0]["lr"]
+            self._log_now(0.0, 0.0, 0.0, current_lr)
 
 # ==============================
 # 3) CLI
