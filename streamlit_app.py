@@ -191,12 +191,13 @@ def _start_training(text: str, epochs: int, batch_size: int, learning_rate: floa
         status_queue.put({"type": "status", "value": "Training läuft..."})
         try:
             # Aufruf der Transformer-spezifischen Trainingsmethode
-            adapter.train_on_ingested_data( # Korrigierter Methodenname
+            adapter.train_on_ingested_data(  # Korrigierter Methodenname
                 text,
                 epochs=epochs,
                 batch_size=batch_size,
                 learning_rate=learning_rate,
-                reset_optimizer=not append, # Optimierer nur zurücksetzen, wenn nicht angefügt
+                reset_optimizer=not append,  # Optimierer nur zurücksetzen, wenn nicht angefügt
+                progress_callback=lambda msg: status_queue.put({"type": "status", "value": msg}),
             )
             status_queue.put({"type": "status", "value": "Training abgeschlossen"})
         except Exception as exc:  # pragma: no cover - nur zur Anzeige in der UI

@@ -263,15 +263,46 @@ class InstrumentedBookAdapter:  # Nicht mehr von adapter_plus.BookAdapter erben
         """Entferne alle registrierten Callbacks (z. B. beim Reset)."""
         self._metric_callbacks.clear()
 
-    def _log_now(self, loss: float = 0.0, ppl: float = 0.0, acc: float = 0.0, lr: float = 0.0):
-        self.metrics.log(self._step_counter, loss, ppl, acc, lr)
+    @staticmethod
+    def _sanitize_metric(
+        value: float,
+        *,
+        clamp_min: Optional[float] = None,
+        clamp_max: Optional[float] = None,
+    ) -> float:
+        """Normalisiert Metriken, bevor sie geloggt oder angezeigt werden."""
+
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return float("nan")
+
+        if not math.isfinite(numeric):
+            return float("nan")
+
+        if clamp_min is not None and numeric < clamp_min:
+            numeric = clamp_min
+        if clamp_max is not None and numeric > clamp_max:
+            numeric = clamp_max
+
+        return numeric
+
+    def _log_now(self, loss: float = 0.0, ppl: float = 0.0, acc: float = 0.0, lr: float = 0.0) -> None:
+        step = int(self._step_counter)
+        safe_loss = self._sanitize_metric(loss)
+        safe_ppl = self._sanitize_metric(ppl, clamp_min=0.0)
+        safe_acc = self._sanitize_metric(acc, clamp_min=0.0, clamp_max=1.0)
+        safe_lr = self._sanitize_metric(lr, clamp_min=0.0)
+
+        self.metrics.log(step, safe_loss, safe_ppl, safe_acc, safe_lr)
+
         if self._metric_callbacks:
             payload = {
-                "step": self.metrics.steps[-1],
-                "loss": self.metrics.loss[-1],
-                "perplexity": self.metrics.perplexity[-1],
-                "accuracy": self.metrics.accuracy[-1],
-                "learning_rate": self.metrics.learning_rate[-1],
+                "step": step,
+                "loss": safe_loss,
+                "perplexity": safe_ppl,
+                "accuracy": safe_acc,
+                "learning_rate": safe_lr,
             }
             for cb in list(self._metric_callbacks):
                 try:
@@ -369,6 +400,7 @@ class InstrumentedBookAdapter:  # Nicht mehr von adapter_plus.BookAdapter erben
         batch_size: int = 4,
         learning_rate: float = 1e-4,
         reset_optimizer: bool = True,
+        progress_callback: Optional[Callable[[str], None]] = None,
     ) -> None:
         """Trainiert das Transformer-Modell auf den ingestierten Daten."""
 
@@ -391,12 +423,26 @@ class InstrumentedBookAdapter:  # Nicht mehr von adapter_plus.BookAdapter erben
         print(f"Starte Training für {epochs} Epochen...")
         for epoch in range(epochs):
             print(f"Epoche {epoch + 1}/{epochs}")
+            if progress_callback is not None:
+                try:
+                    progress_callback(f"Epoche {epoch + 1}/{epochs} gestartet")
+                except Exception:
+                    pass
+
             context_window = self._effective_context_window()
             for batch_idx, (input_ids, target_ids) in enumerate(data_loader, start=1):
                 if input_ids.size(1) > context_window:
                     input_ids = input_ids[:, :context_window].contiguous()
                     target_ids = target_ids[:, :context_window].contiguous()
                 loss = self.trainer.train_step(input_ids, target_ids)
+
+                if not math.isfinite(loss):
+                    msg = (
+                        "Trainingsverlust wurde nicht-endlich (NaN/Inf). "
+                        "Bitte Lernrate oder Batch-Größe reduzieren."
+                    )
+                    print(msg)
+                    raise RuntimeError(msg)
 
                 with torch.no_grad():
                     input_device = input_ids.to(self.device)
@@ -408,9 +454,14 @@ class InstrumentedBookAdapter:  # Nicht mehr von adapter_plus.BookAdapter erben
                         correct = (predictions == target_device) & mask
                         accuracy = correct.float().sum().item() / mask.float().sum().item()
                     else:
-                        accuracy = 0.0
+                        accuracy = float("nan")
 
-                perplexity = math.exp(loss) if loss < 20 else float("inf")
+                perplexity = float("nan")
+                if math.isfinite(loss) and loss < 80:
+                    try:
+                        perplexity = math.exp(loss)
+                    except OverflowError:
+                        perplexity = float("nan")
                 current_lr = self.trainer.optimizer.param_groups[0]["lr"]
 
                 self._step_counter += 1
@@ -420,6 +471,21 @@ class InstrumentedBookAdapter:  # Nicht mehr von adapter_plus.BookAdapter erben
                     print(
                         f"  Schritt {self._step_counter}: Loss={loss:.4f}, PPL={perplexity:.2f}, Acc={accuracy:.2f}, LR={current_lr:.6f}"
                     )
+
+                if progress_callback is not None:
+                    if batch_idx == 1 or batch_idx == len(data_loader) or batch_idx % 5 == 0:
+                        try:
+                            progress_callback(
+                                f"Epoche {epoch + 1}/{epochs}: Batch {batch_idx}/{len(data_loader)}"
+                            )
+                        except Exception:
+                            pass
+
+            if progress_callback is not None:
+                try:
+                    progress_callback(f"Epoche {epoch + 1}/{epochs} abgeschlossen")
+                except Exception:
+                    pass
 
         print("Training abgeschlossen.")
 
