@@ -205,19 +205,33 @@ class InstrumentedBookAdapter:  # Nicht mehr von adapter_plus.BookAdapter erben
         scaled_window = int(context_window) * 64 if context_window else 0
         target_max_length = max(scaled_window, 1_000_000)
 
-        current_max_length = getattr(self.tokenizer, "model_max_length", None)
-        if isinstance(current_max_length, int):
-            if current_max_length < target_max_length:
-                try:
-                    self.tokenizer.model_max_length = target_max_length
-                except (AttributeError, ValueError):
-                    pass
+        # Viele Aufrufer reichen den in transformer_core.Tokenizer verpackten
+        # Hugging-Face-Tokenizer hinein.  Wir passen daher sowohl die Hülle
+        # als auch den darunterliegenden Tokenizer an, damit Warnungen über
+        # "model_max_length" konsistent verschwinden.
+        hf_tokenizer = getattr(self.tokenizer, "tokenizer", self.tokenizer)
+
+        current_max_length = getattr(hf_tokenizer, "model_max_length", None)
+        if isinstance(current_max_length, int) and current_max_length < target_max_length:
+            try:
+                hf_tokenizer.model_max_length = target_max_length
+            except (AttributeError, ValueError):
+                pass
+
         # Einige Tokenizer lesen den Wert zusätzlich aus init_kwargs aus.
-        init_kwargs = getattr(self.tokenizer, "init_kwargs", None)
+        init_kwargs = getattr(hf_tokenizer, "init_kwargs", None)
         if isinstance(init_kwargs, dict):
             existing = init_kwargs.get("model_max_length")
             if not isinstance(existing, int) or existing < target_max_length:
                 init_kwargs["model_max_length"] = target_max_length
+
+        # Für Konsumenten, die direkt auf dem Wrapper nachsehen, spiegeln
+        # wir den Wert ebenfalls.
+        if getattr(self.tokenizer, "model_max_length", None) != getattr(hf_tokenizer, "model_max_length", None):
+            try:
+                self.tokenizer.model_max_length = getattr(hf_tokenizer, "model_max_length", None)
+            except Exception:
+                pass
 
         # Initialisiere den Trainer mit allen erforderlichen Parametern
         self.trainer = tc.TransformerTrainer(
