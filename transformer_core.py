@@ -321,7 +321,10 @@ class TransformerTrainer:
         # Für die Verlustberechnung müssen wir die Dimensionen anpassen
         # output: [batch_size * seq_len, vocab_size]
         # target_ids: [batch_size * seq_len]
-        loss = self.criterion(output.view(-1, output.size(-1)), target_ids.view(-1))
+        loss = self.criterion(
+            output.reshape(-1, output.size(-1)),
+            target_ids.reshape(-1),
+        )
 
         loss.backward()
         # Optional: Gradient Clipping
@@ -369,7 +372,10 @@ class TransformerTrainer:
 
         with torch.no_grad():
             output = self.model(input_ids)
-            loss = self.criterion(output.view(-1, output.size(-1)), target_ids.view(-1))
+            loss = self.criterion(
+                output.reshape(-1, output.size(-1)),
+                target_ids.reshape(-1),
+            )
         return loss.item()
 
     def save_model(self, path: str):
