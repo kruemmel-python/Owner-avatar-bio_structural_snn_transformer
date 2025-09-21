@@ -563,8 +563,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     d_model = 128
     n_heads = 4
     n_layers = 2
-    
-    transformer_core = tc.TransformerCore(vocab_size, d_model, n_heads, n_layers)
+    d_ff = d_model * 4
+    max_seq_len = 512
+    dropout = 0.1
+
+    transformer_core = tc.TransformerCore(
+        vocab_size=vocab_size,
+        d_model=d_model,
+        num_layers=n_layers,
+        num_heads=n_heads,
+        d_ff=d_ff,
+        max_seq_len=max_seq_len,
+        dropout=dropout,
+    )
     # Initialisiere den Adapter mit allen notwendigen Komponenten
     inst = InstrumentedBookAdapter(
         transformer_core=transformer_core,
@@ -585,7 +596,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             # Bei Fehler mit neuem Modell fortfahren
             # Tokenizer muss neu initialisiert werden, falls der alte nicht geladen werden konnte
             new_tokenizer = tc.Tokenizer()
-            new_transformer_core = tc.TransformerCore(new_tokenizer.vocab_size, d_model, n_heads, n_layers)
+            new_transformer_core = tc.TransformerCore(
+                vocab_size=new_tokenizer.vocab_size,
+                d_model=d_model,
+                num_layers=n_layers,
+                num_heads=n_heads,
+                d_ff=d_ff,
+                max_seq_len=max_seq_len,
+                dropout=dropout,
+            )
             inst = InstrumentedBookAdapter(
                 transformer_core=new_transformer_core,
                 tokenizer=new_tokenizer,
