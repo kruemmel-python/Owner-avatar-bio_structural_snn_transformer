@@ -417,11 +417,24 @@ class InstrumentedBookAdapter:  # Nicht mehr von adapter_plus.BookAdapter erben
         else:
             self.trainer.set_learning_rate(learning_rate)
 
+        # Der DataLoader kann – insbesondere unter Windows – nach einer
+        # vollständigen Iteration in Hintergrund-Threads als „erschöpft"
+        # betrachtet werden.  Wir initialisieren daher für jede Epoche eine
+        # frische Instanz und merken uns die Batch-Anzahl separat.
         data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
         self.trainer.set_training_data(data_loader)
+        try:
+            total_batches = len(data_loader)
+        except TypeError:
+            safe_batch = max(batch_size, 1)
+            total_batches = max(math.ceil(len(dataset) / safe_batch), 1)
 
         print(f"Starte Training für {epochs} Epochen...")
         for epoch in range(epochs):
+            if epoch > 0:
+                data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+                # Direkt zuweisen, um Mehrfachausgaben in set_training_data zu vermeiden
+                self.trainer.data_loader = data_loader
             print(f"Epoche {epoch + 1}/{epochs}")
             if progress_callback is not None:
                 try:
@@ -473,10 +486,15 @@ class InstrumentedBookAdapter:  # Nicht mehr von adapter_plus.BookAdapter erben
                     )
 
                 if progress_callback is not None:
-                    if batch_idx == 1 or batch_idx == len(data_loader) or batch_idx % 5 == 0:
+                    should_emit = (
+                        batch_idx == 1
+                        or batch_idx == total_batches
+                        or batch_idx % 5 == 0
+                    )
+                    if should_emit:
                         try:
                             progress_callback(
-                                f"Epoche {epoch + 1}/{epochs}: Batch {batch_idx}/{len(data_loader)}"
+                                f"Epoche {epoch + 1}/{epochs}: Batch {batch_idx}/{total_batches}"
                             )
                         except Exception:
                             pass
