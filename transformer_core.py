@@ -218,6 +218,11 @@ class TransformerCore(nn.Module):
 
         self.init_weights()
 
+    @property
+    def vocab_size(self) -> int:
+        """Returns the current output vocabulary size."""
+        return self.output_linear.out_features
+
     def init_weights(self):
         initrange = 0.1
         self.embedding.weight.data.uniform_(-initrange, initrange)
@@ -258,6 +263,36 @@ class TransformerCore(nn.Module):
         output = self.output_linear(src) # [seq_len, batch_size, vocab_size]
         output = output.transpose(0, 1) # [batch_size, seq_len, vocab_size]
         return output
+
+    def expand_vocab(self, new_vocab_size: int) -> None:
+        """Expands embedding and output layers to cover a larger vocabulary."""
+
+        if new_vocab_size <= self.vocab_size:
+            return
+
+        device = next(self.parameters()).device
+        old_vocab_size = self.vocab_size
+
+        new_embedding = nn.Embedding(new_vocab_size, self.d_model).to(device)
+        new_embedding.weight.data[:old_vocab_size] = self.embedding.weight.data
+        nn.init.uniform_(
+            new_embedding.weight.data[old_vocab_size:],
+            -0.1,
+            0.1,
+        )
+
+        new_output = nn.Linear(self.d_model, new_vocab_size).to(device)
+        new_output.weight.data[:old_vocab_size] = self.output_linear.weight.data
+        nn.init.uniform_(
+            new_output.weight.data[old_vocab_size:],
+            -0.1,
+            0.1,
+        )
+        new_output.bias.data[:old_vocab_size] = self.output_linear.bias.data
+        new_output.bias.data[old_vocab_size:] = 0.0
+
+        self.embedding = new_embedding
+        self.output_linear = new_output
 
 class TransformerTrainer:
     """

@@ -370,6 +370,7 @@ class InstrumentedBookAdapter:  # Nicht mehr von adapter_plus.BookAdapter erben
             padding="do_not_pad",
         )
         token_ids = token_tensor.squeeze(0).tolist()
+        self._ensure_model_capacity_for_tokens(token_ids)
         self.ingested_text_data.append(token_ids)
 
         # Anfangslog (mit 0-Werten, da noch kein Training)
@@ -412,6 +413,27 @@ class InstrumentedBookAdapter:  # Nicht mehr von adapter_plus.BookAdapter erben
         input_tensor = torch.tensor(inputs, dtype=torch.long)
         target_tensor = torch.tensor(targets, dtype=torch.long)
         return TensorDataset(input_tensor, target_tensor)
+
+    def _ensure_model_capacity_for_tokens(self, token_ids: List[int]) -> None:
+        if not token_ids:
+            return
+
+        max_observed = max(token_ids)
+        pad_id = self.tokenizer.pad_token_id
+        required = max(max_observed, pad_id)
+        current_vocab = self.transformer_core.vocab_size
+
+        if required < current_vocab:
+            return
+
+        new_vocab = required + 1
+        print(
+            f"Erweitere Vokabular von {current_vocab} auf {new_vocab}, "
+            f"um Token-ID {required} abzudecken."
+        )
+        self.transformer_core.expand_vocab(new_vocab)
+        self.transformer_core.to(self.device)
+        self.trainer.reset_optimizer(self.trainer.learning_rate)
 
     def train_on_ingested_data(
         self,
