@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from typing import Iterator
 from transformers import AutoTokenizer
 from torch.utils.data import DataLoader
 
@@ -288,6 +289,12 @@ class TransformerTrainer:
         self.data_loader: DataLoader = None # Wird später mit Trainingsdaten gesetzt
         self.learning_rate = optimizer.param_groups[0]['lr'] # Initialisiere Lernrate
 
+    def load_optimizer_state_dict(self, state_dict: dict) -> None:
+        """Lädt einen gespeicherten Optimiererzustand."""
+        self.optimizer.load_state_dict(state_dict)
+        if self.optimizer.param_groups:
+            self.learning_rate = self.optimizer.param_groups[0]['lr']
+
     def reset_optimizer(self, learning_rate: float = None):
         """
         Setzt den Optimierer mit der aktuellen oder einer neuen Lernrate zurück.
@@ -313,14 +320,14 @@ class TransformerTrainer:
         self.data_loader = data_loader
         print(f"Trainingsdaten-Loader gesetzt. Anzahl der Batches: {len(self.data_loader) if self.data_loader else 0}")
 
-    def train_step(self, input_ids: torch.Tensor, target_ids: torch.Tensor) -> float:
+    def train_step(self, input_ids: torch.Tensor, target_ids: torch.Tensor) -> tuple[float, float, float]:
         """
         Führt einen einzelnen Trainingsschritt durch.
         Args:
             input_ids: Batch von Eingabe-Token-IDs, shape [batch_size, seq_len]
             target_ids: Batch von Ziel-Token-IDs, shape [batch_size, seq_len]
         Returns:
-            Verlustwert für diesen Schritt.
+            Tupel aus (Loss, Perplexity, Accuracy) für diesen Schritt.
         """
         self.model.train()
         self.optimizer.zero_grad()
@@ -337,12 +344,28 @@ class TransformerTrainer:
         # target_ids: [batch_size * seq_len]
         loss = self.criterion(output.view(-1, output.size(-1)), target_ids.view(-1))
 
+        loss_value = loss.item()
+        with torch.no_grad():
+            predictions = output.argmax(dim=-1)
+            pad_token_id = self.tokenizer.pad_token_id
+            if pad_token_id is not None:
+                mask = target_ids != pad_token_id
+                valid_tokens = mask.sum().item()
+                if valid_tokens > 0:
+                    correct_tokens = (predictions == target_ids) & mask
+                    accuracy = correct_tokens.sum().item() / valid_tokens
+                else:
+                    accuracy = 0.0
+            else:
+                accuracy = (predictions == target_ids).float().mean().item()
+        perplexity = math.exp(min(loss_value, 20.0))
+
         loss.backward()
         # Optional: Gradient Clipping
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.optimizer.step()
 
-        return loss.item()
+        return loss_value, perplexity, accuracy
 
     def train_epoch(self) -> float:
         """
@@ -358,7 +381,7 @@ class TransformerTrainer:
         num_batches = 0
 
         for batch_idx, (input_ids, target_ids) in enumerate(self.data_loader):
-            loss = self.train_step(input_ids, target_ids)
+            loss, _, _ = self.train_step(input_ids, target_ids)
             total_loss += loss
             num_batches += 1
             # Optional: Fortschritt ausgeben
@@ -367,6 +390,19 @@ class TransformerTrainer:
 
         avg_loss = total_loss / num_batches if num_batches > 0 else 0
         return avg_loss
+
+    def train_batches(self) -> Iterator[tuple[float, float, float, float]]:
+        """
+        Iteriert über den aktuellen DataLoader und liefert Metriken je Batch.
+        Returns:
+            Iterator über Tupel (Loss, Perplexity, Accuracy, Learning Rate).
+        """
+        if self.data_loader is None:
+            raise ValueError("Trainingsdaten-Loader wurde nicht gesetzt. Bitte rufen Sie 'set_training_data' auf.")
+
+        for input_ids, target_ids in self.data_loader:
+            loss, perplexity, accuracy = self.train_step(input_ids, target_ids)
+            yield loss, perplexity, accuracy, self.optimizer.param_groups[0]['lr']
 
     def evaluate_step(self, input_ids: torch.Tensor, target_ids: torch.Tensor) -> float:
         """
