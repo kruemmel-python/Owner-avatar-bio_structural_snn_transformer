@@ -148,17 +148,23 @@ class MultiHeadSelfAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
-        batch_size = query.size(0)
+        """Führt Multi-Head Self-Attention auf sequenz-erster Eingabe aus."""
+
+        # Die Transformer-Architektur in dieser Datei arbeitet sequenz-erste
+        # ([seq_len, batch_size, d_model]). Für die Aufteilung in Attention-Köpfe
+        # konvertieren wir temporär in die Batch-First-Repräsentation.
+        seq_len, batch_size, _ = query.size()
 
         # 1) Lineare Transformationen und Aufteilung in Köpfe
-        query = self.q_linear(query).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
-        key = self.k_linear(key).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
-        value = self.v_linear(value).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
+        query = self.q_linear(query).view(seq_len, batch_size, self.num_heads, self.d_k).permute(1, 2, 0, 3)
+        key = self.k_linear(key).view(seq_len, batch_size, self.num_heads, self.d_k).permute(1, 2, 0, 3)
+        value = self.v_linear(value).view(seq_len, batch_size, self.num_heads, self.d_k).permute(1, 2, 0, 3)
 
         # 2) Skaliertes Dot-Product Attention
         scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(self.d_k)
 
         if mask is not None:
+            # Erlaube Broadcast über Batch- und Kopf-Dimensionen.
             scores = scores.masked_fill(mask == 0, -1e9) # Maskiere unerwünschte Verbindungen
 
         attention_weights = F.softmax(scores, dim=-1)
@@ -166,8 +172,8 @@ class MultiHeadSelfAttention(nn.Module):
 
         output = torch.matmul(attention_weights, value)
 
-        # 3) Konkatenation der Köpfe und finale lineare Transformation
-        output = output.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
+        # 3) Rücktransponieren in sequenz-erste Darstellung und finale lineare Transformation
+        output = output.permute(2, 0, 1, 3).contiguous().view(seq_len, batch_size, self.d_model)
         output = self.out_linear(output)
         return output
 
