@@ -304,8 +304,15 @@ class InstrumentedBookAdapter: # Nicht mehr von adapter_plus.BookAdapter erben
             "step_counter": self._step_counter,
             "ingested_text_data": [list(chunk) for chunk in self.ingested_text_data],
         }
+        # torch.save kann bei BytesIO mit dem Zip-Serialisierer in seltenen Fällen
+        # mit einer "unexpected pos"-Meldung abbrechen. Wir versuchen daher zuerst
+        # den Standardweg und fallen bei Problemen auf das Legacy-Format zurück.
         buffer = io.BytesIO()
-        tc.torch.save(payload, buffer)
+        try:
+            tc.torch.save(payload, buffer)
+        except RuntimeError:
+            buffer = io.BytesIO()
+            tc.torch.save(payload, buffer, _use_new_zipfile_serialization=False)
         return buffer.getvalue()
 
     def import_brain_state(self, data: bytes) -> None:
