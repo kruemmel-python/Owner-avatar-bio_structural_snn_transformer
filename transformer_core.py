@@ -19,16 +19,30 @@ class Tokenizer:
         # Füge ein Padding-Token hinzu, falls nicht vorhanden, und setze es als pad_token
         if self.tokenizer.pad_token is None:
             self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+        # Einige Tokenizer (z. B. GPT2) besitzen eine harte Standard-Limitierung von 1024
+        # Token. Für unser Training auf langen Büchern ist das kontraproduktiv, daher wird
+        # die maximale Sequenzlänge auf einen sehr großen Wert gesetzt. Dies verhindert
+        # Warnungen und – kombiniert mit deaktivierter Trunkierung – das Abschneiden
+        # langer Texte während der Ingestion.
+        try:
+            self.tokenizer.model_max_length = int(1e9)
+            if hasattr(self.tokenizer, "init_kwargs"):
+                self.tokenizer.init_kwargs["model_max_length"] = int(1e9)
+        except Exception:
+            # Falls der Tokenizer diese Attribute nicht kennt, ignorieren – es handelt
+            # sich nur um einen Schutz gegen aggressive Kürzungen.
+            pass
         # Stelle sicher, dass das Modell die neue Vokabulargröße kennt, falls der Tokenizer erweitert wurde.
         # Dies muss im Modell selbst gehandhabt werden, wenn es initialisiert wird.
 
-    def encode(self, text: str, max_length: int = None, truncation: bool = True, padding: str = 'max_length') -> torch.Tensor:
+    def encode(self, text: str, max_length: int = None, truncation: bool = False, padding: str = 'longest') -> torch.Tensor:
         """
         Kodiert einen Text in Token-IDs.
         Args:
             text: Der zu kodierende Text.
-            max_length: Maximale Sequenzlänge.
-            truncation: Ob der Text abgeschnitten werden soll, wenn er länger als max_length ist.
+            max_length: Maximale Sequenzlänge. Wenn ``None`` wird keine harte Grenze gesetzt.
+            truncation: Ob der Text abgeschnitten werden soll. Standardmäßig deaktiviert,
+                damit ganze Bücher ingestiert werden können.
             padding: Padding-Strategie ('max_length', 'longest', 'do_not_pad').
         Returns:
             Ein Tensor von Token-IDs.
@@ -78,24 +92,40 @@ class Tokenizer:
 class PositionalEncoding(nn.Module):
     """
     Fügt Positionsinformationen zu den Eingabe-Embeddings hinzu.
+
+    Die ursprüngliche Implementierung war auf eine feste maximale Sequenzlänge begrenzt.
+    Für Buchlängen von weit über 100k Tokens wird die Positional Encoding nun dynamisch
+    erweitert, sobald längere Sequenzen beobachtet werden.
     """
+
     def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
         super().__init__()
         self.dropout = nn.Dropout(p=dropout)
+        self.d_model = d_model
+        self.register_buffer('pe', self._build_pe(max_len), persistent=False)
 
-        position = torch.arange(max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
-        pe = torch.zeros(max_len, 1, d_model)
+    def _build_pe(self, length: int, device: torch.device | None = None) -> torch.Tensor:
+        position = torch.arange(length, device=device).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, self.d_model, 2, device=device) * (-math.log(10000.0) / self.d_model))
+        pe = torch.zeros(length, 1, self.d_model, device=device)
         pe[:, 0, 0::2] = torch.sin(position * div_term)
         pe[:, 0, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe)
+        return pe
+
+    def _ensure_length(self, seq_len: int, device: torch.device) -> None:
+        if self.pe is None or self.pe.size(0) >= seq_len:
+            return
+        new_pe = self._build_pe(seq_len, device=device)
+        self.register_buffer('pe', new_pe, persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
             x: Tensor, shape [seq_len, batch_size, embed_dim]
         """
-        x = x + self.pe[:x.size(0)]
+        seq_len = x.size(0)
+        self._ensure_length(seq_len, x.device)
+        x = x + self.pe[:seq_len]
         return self.dropout(x)
 
 class MultiHeadSelfAttention(nn.Module):
@@ -403,12 +433,6 @@ class TransformerTrainer:
         current_input_ids = prompt_ids.to(self.device)
 
         for _ in range(max_new_tokens):
-            # Beschränke die Eingabesequenz auf die maximale Sequenzlänge des Modells
-            # Dies ist wichtig, da PositionalEncoding eine feste max_len hat
-            max_model_seq_len = self.model.pos_encoder.pe.size(0)
-            if current_input_ids.size(1) > max_model_seq_len:
-                current_input_ids = current_input_ids[:, -max_model_seq_len:]
-
             with torch.no_grad():
                 output = self.model(current_input_ids) # [1, current_seq_len, vocab_size]
 
