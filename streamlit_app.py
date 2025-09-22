@@ -124,12 +124,16 @@ def _ensure_state() -> None:
 def _create_adapter(metric_queue: queue.Queue) -> InstrumentedBookAdapter:
     # Initialisiere den Tokenizer und das Transformer-Modell
     tokenizer = Tokenizer()
+    # Für die Streamlit-Oberfläche nutzen wir eine kompakte Konfiguration,
+    # damit Trainings- und Exportvorgänge den verfügbaren Arbeitsspeicher
+    # nicht überlasten. Die Parameter orientieren sich an der leichten
+    # CLI-Variante des Modells.
     model = TransformerCore(
         vocab_size=tokenizer.vocab_size, # Vokabulargröße vom Tokenizer
-        d_model=768,
-        num_heads=12,
-        num_layers=12,
-        d_ff=3072,
+        d_model=128,
+        num_heads=4,
+        num_layers=2,
+        d_ff=512,
         max_seq_len=512,
         dropout=0.1
     ).to(st.session_state.device) # Modell auf das Gerät verschieben
@@ -187,12 +191,13 @@ def _start_training(text: str, epochs: int, batch_size: int, learning_rate: floa
         status_queue.put({"type": "status", "value": "Training läuft..."})
         try:
             # Aufruf der Transformer-spezifischen Trainingsmethode
-            adapter.train_on_ingested_data( # Korrigierter Methodenname
+            adapter.train_on_ingested_data(  # Korrigierter Methodenname
                 text,
                 epochs=epochs,
                 batch_size=batch_size,
                 learning_rate=learning_rate,
-                reset_optimizer=not append, # Optimierer nur zurücksetzen, wenn nicht angefügt
+                reset_optimizer=not append,  # Optimierer nur zurücksetzen, wenn nicht angefügt
+                progress_callback=lambda msg: status_queue.put({"type": "status", "value": msg}),
             )
             status_queue.put({"type": "status", "value": "Training abgeschlossen"})
         except Exception as exc:  # pragma: no cover - nur zur Anzeige in der UI
@@ -351,19 +356,27 @@ def _render_persistence() -> None:
     with st.expander("💾 Modell speichern & laden", expanded=True):
         st.subheader("Aktuellen Zustand sichern")
         if adapter:
-            try:
-                model_bytes = adapter.export_model_state()
-            except Exception as exc:  # pragma: no cover - Schutz vor Serialisierungsfehlern
-                st.error(f"Export fehlgeschlagen: {exc}")
+            if state.training_running:
+                st.info("Training läuft – Export wird nach Abschluss wieder aktiviert.")
+                model_bytes: bytes | None = None
+            else:
                 model_bytes = None
-            if model_bytes:
-                st.download_button(
-                    "🧠 Modell herunterladen",
-                    data=model_bytes,
-                    file_name="transformer_model.pth",
-                    mime="application/octet-stream",
-                )
-            st.caption("Enthält den Zustand des Transformer-Modells, des Optimierers, des Tokenizers und Metriken.")
+                try:
+                    model_bytes = adapter.export_model_state()
+                except Exception as exc:  # pragma: no cover - Schutz vor Serialisierungsfehlern
+                    st.error(f"Export fehlgeschlagen: {exc}")
+                if model_bytes:
+                    st.download_button(
+                        "🧠 Modell herunterladen",
+                        data=model_bytes,
+                        file_name="transformer_model.pth",
+                        mime="application/octet-stream",
+                    )
+                else:
+                    st.caption("Noch kein exportierbarer Zustand verfügbar.")
+            st.caption(
+                "Enthält den Zustand des Transformer-Modells, des Optimierers, des Tokenizers und Metriken."
+            )
         else:
             st.info("Noch kein trainiertes Modell vorhanden.")
 

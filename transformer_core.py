@@ -116,28 +116,46 @@ class MultiHeadSelfAttention(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
-        batch_size = query.size(0)
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        mask: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """Berechnet Multi-Head Self-Attention im Sequenz-ersten Format."""
 
-        # 1) Lineare Transformationen und Aufteilung in Köpfe
-        query = self.q_linear(query).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
-        key = self.k_linear(key).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
-        value = self.v_linear(value).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
+        seq_len, batch_size, _ = query.size()
+
+        # 1) Lineare Projektionen und Aufteilung in Köpfe (Batch-First)
+        query = self.q_linear(query).permute(1, 0, 2)
+        key = self.k_linear(key).permute(1, 0, 2)
+        value = self.v_linear(value).permute(1, 0, 2)
+
+        query = query.contiguous().view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
+        key = key.contiguous().view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
+        value = value.contiguous().view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
 
         # 2) Skaliertes Dot-Product Attention
         scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(self.d_k)
 
         if mask is not None:
-            scores = scores.masked_fill(mask == 0, -1e9) # Maskiere unerwünschte Verbindungen
+            if mask.dim() == 2:
+                mask = mask.unsqueeze(0).unsqueeze(0)
+            elif mask.dim() == 3:
+                mask = mask.unsqueeze(1)
+            mask = mask.to(device=scores.device, dtype=scores.dtype)
+            scores = scores + mask
 
         attention_weights = F.softmax(scores, dim=-1)
         attention_weights = self.dropout(attention_weights)
 
         output = torch.matmul(attention_weights, value)
 
-        # 3) Konkatenation der Köpfe und finale lineare Transformation
-        output = output.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
+        # 3) Konkatenation der Köpfe und finale lineare Transformation (zurück zu Sequenz-erster Form)
+        output = output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
         output = self.out_linear(output)
+        output = output.permute(1, 0, 2)
         return output
 
 class FeedForward(nn.Module):
@@ -200,6 +218,11 @@ class TransformerCore(nn.Module):
 
         self.init_weights()
 
+    @property
+    def vocab_size(self) -> int:
+        """Returns the current output vocabulary size."""
+        return self.output_linear.out_features
+
     def init_weights(self):
         initrange = 0.1
         self.embedding.weight.data.uniform_(-initrange, initrange)
@@ -229,8 +252,6 @@ class TransformerCore(nn.Module):
             # Erstelle eine kausale Maske, wenn keine bereitgestellt wird
             seq_len = src.size(0)
             src_mask = self.generate_square_subsequent_mask(seq_len).to(src.device)
-            # Die Maske muss für Multi-Head Attention die Form [1, num_heads, seq_len, seq_len] haben
-            src_mask = src_mask.unsqueeze(0).unsqueeze(0) # [1, 1, seq_len, seq_len]
 
         src = self.embedding(src) * math.sqrt(self.d_model)
         src = self.pos_encoder(src)
@@ -242,6 +263,36 @@ class TransformerCore(nn.Module):
         output = self.output_linear(src) # [seq_len, batch_size, vocab_size]
         output = output.transpose(0, 1) # [batch_size, seq_len, vocab_size]
         return output
+
+    def expand_vocab(self, new_vocab_size: int) -> None:
+        """Expands embedding and output layers to cover a larger vocabulary."""
+
+        if new_vocab_size <= self.vocab_size:
+            return
+
+        device = next(self.parameters()).device
+        old_vocab_size = self.vocab_size
+
+        new_embedding = nn.Embedding(new_vocab_size, self.d_model).to(device)
+        new_embedding.weight.data[:old_vocab_size] = self.embedding.weight.data
+        nn.init.uniform_(
+            new_embedding.weight.data[old_vocab_size:],
+            -0.1,
+            0.1,
+        )
+
+        new_output = nn.Linear(self.d_model, new_vocab_size).to(device)
+        new_output.weight.data[:old_vocab_size] = self.output_linear.weight.data
+        nn.init.uniform_(
+            new_output.weight.data[old_vocab_size:],
+            -0.1,
+            0.1,
+        )
+        new_output.bias.data[:old_vocab_size] = self.output_linear.bias.data
+        new_output.bias.data[old_vocab_size:] = 0.0
+
+        self.embedding = new_embedding
+        self.output_linear = new_output
 
 class TransformerTrainer:
     """
@@ -305,7 +356,10 @@ class TransformerTrainer:
         # Für die Verlustberechnung müssen wir die Dimensionen anpassen
         # output: [batch_size * seq_len, vocab_size]
         # target_ids: [batch_size * seq_len]
-        loss = self.criterion(output.view(-1, output.size(-1)), target_ids.view(-1))
+        loss = self.criterion(
+            output.reshape(-1, output.size(-1)),
+            target_ids.reshape(-1),
+        )
 
         loss.backward()
         # Optional: Gradient Clipping
@@ -353,7 +407,10 @@ class TransformerTrainer:
 
         with torch.no_grad():
             output = self.model(input_ids)
-            loss = self.criterion(output.view(-1, output.size(-1)), target_ids.view(-1))
+            loss = self.criterion(
+                output.reshape(-1, output.size(-1)),
+                target_ids.reshape(-1),
+            )
         return loss.item()
 
     def save_model(self, path: str):
