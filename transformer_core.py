@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from typing import Iterator
 from transformers import AutoTokenizer
 from torch.utils.data import DataLoader
 
@@ -19,16 +20,30 @@ class Tokenizer:
         # Füge ein Padding-Token hinzu, falls nicht vorhanden, und setze es als pad_token
         if self.tokenizer.pad_token is None:
             self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+        # Einige Tokenizer (z. B. GPT2) besitzen eine harte Standard-Limitierung von 1024
+        # Token. Für unser Training auf langen Büchern ist das kontraproduktiv, daher wird
+        # die maximale Sequenzlänge auf einen sehr großen Wert gesetzt. Dies verhindert
+        # Warnungen und – kombiniert mit deaktivierter Trunkierung – das Abschneiden
+        # langer Texte während der Ingestion.
+        try:
+            self.tokenizer.model_max_length = int(1e9)
+            if hasattr(self.tokenizer, "init_kwargs"):
+                self.tokenizer.init_kwargs["model_max_length"] = int(1e9)
+        except Exception:
+            # Falls der Tokenizer diese Attribute nicht kennt, ignorieren – es handelt
+            # sich nur um einen Schutz gegen aggressive Kürzungen.
+            pass
         # Stelle sicher, dass das Modell die neue Vokabulargröße kennt, falls der Tokenizer erweitert wurde.
         # Dies muss im Modell selbst gehandhabt werden, wenn es initialisiert wird.
 
-    def encode(self, text: str, max_length: int = None, truncation: bool = True, padding: str = 'max_length') -> torch.Tensor:
+    def encode(self, text: str, max_length: int = None, truncation: bool = False, padding: str = 'longest') -> torch.Tensor:
         """
         Kodiert einen Text in Token-IDs.
         Args:
             text: Der zu kodierende Text.
-            max_length: Maximale Sequenzlänge.
-            truncation: Ob der Text abgeschnitten werden soll, wenn er länger als max_length ist.
+            max_length: Maximale Sequenzlänge. Wenn ``None`` wird keine harte Grenze gesetzt.
+            truncation: Ob der Text abgeschnitten werden soll. Standardmäßig deaktiviert,
+                damit ganze Bücher ingestiert werden können.
             padding: Padding-Strategie ('max_length', 'longest', 'do_not_pad').
         Returns:
             Ein Tensor von Token-IDs.
@@ -78,24 +93,40 @@ class Tokenizer:
 class PositionalEncoding(nn.Module):
     """
     Fügt Positionsinformationen zu den Eingabe-Embeddings hinzu.
+
+    Die ursprüngliche Implementierung war auf eine feste maximale Sequenzlänge begrenzt.
+    Für Buchlängen von weit über 100k Tokens wird die Positional Encoding nun dynamisch
+    erweitert, sobald längere Sequenzen beobachtet werden.
     """
+
     def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
         super().__init__()
         self.dropout = nn.Dropout(p=dropout)
+        self.d_model = d_model
+        self.register_buffer('pe', self._build_pe(max_len), persistent=False)
 
-        position = torch.arange(max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
-        pe = torch.zeros(max_len, 1, d_model)
+    def _build_pe(self, length: int, device: torch.device | None = None) -> torch.Tensor:
+        position = torch.arange(length, device=device).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, self.d_model, 2, device=device) * (-math.log(10000.0) / self.d_model))
+        pe = torch.zeros(length, 1, self.d_model, device=device)
         pe[:, 0, 0::2] = torch.sin(position * div_term)
         pe[:, 0, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe)
+        return pe
+
+    def _ensure_length(self, seq_len: int, device: torch.device) -> None:
+        if self.pe is None or self.pe.size(0) >= seq_len:
+            return
+        new_pe = self._build_pe(seq_len, device=device)
+        self.register_buffer('pe', new_pe, persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
             x: Tensor, shape [seq_len, batch_size, embed_dim]
         """
-        x = x + self.pe[:x.size(0)]
+        seq_len = x.size(0)
+        self._ensure_length(seq_len, x.device)
+        x = x + self.pe[:seq_len]
         return self.dropout(x)
 
 class MultiHeadSelfAttention(nn.Module):
@@ -117,17 +148,23 @@ class MultiHeadSelfAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
-        batch_size = query.size(0)
+        """Führt Multi-Head Self-Attention auf sequenz-erster Eingabe aus."""
+
+        # Die Transformer-Architektur in dieser Datei arbeitet sequenz-erste
+        # ([seq_len, batch_size, d_model]). Für die Aufteilung in Attention-Köpfe
+        # konvertieren wir temporär in die Batch-First-Repräsentation.
+        seq_len, batch_size, _ = query.size()
 
         # 1) Lineare Transformationen und Aufteilung in Köpfe
-        query = self.q_linear(query).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
-        key = self.k_linear(key).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
-        value = self.v_linear(value).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
+        query = self.q_linear(query).reshape(seq_len, batch_size, self.num_heads, self.d_k).permute(1, 2, 0, 3)
+        key = self.k_linear(key).reshape(seq_len, batch_size, self.num_heads, self.d_k).permute(1, 2, 0, 3)
+        value = self.v_linear(value).reshape(seq_len, batch_size, self.num_heads, self.d_k).permute(1, 2, 0, 3)
 
         # 2) Skaliertes Dot-Product Attention
         scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(self.d_k)
 
         if mask is not None:
+            # Erlaube Broadcast über Batch- und Kopf-Dimensionen.
             scores = scores.masked_fill(mask == 0, -1e9) # Maskiere unerwünschte Verbindungen
 
         attention_weights = F.softmax(scores, dim=-1)
@@ -135,8 +172,8 @@ class MultiHeadSelfAttention(nn.Module):
 
         output = torch.matmul(attention_weights, value)
 
-        # 3) Konkatenation der Köpfe und finale lineare Transformation
-        output = output.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
+        # 3) Rücktransponieren in sequenz-erste Darstellung und finale lineare Transformation
+        output = output.permute(2, 0, 1, 3).contiguous().reshape(seq_len, batch_size, self.d_model)
         output = self.out_linear(output)
         return output
 
@@ -258,6 +295,12 @@ class TransformerTrainer:
         self.data_loader: DataLoader = None # Wird später mit Trainingsdaten gesetzt
         self.learning_rate = optimizer.param_groups[0]['lr'] # Initialisiere Lernrate
 
+    def load_optimizer_state_dict(self, state_dict: dict) -> None:
+        """Lädt einen gespeicherten Optimiererzustand."""
+        self.optimizer.load_state_dict(state_dict)
+        if self.optimizer.param_groups:
+            self.learning_rate = self.optimizer.param_groups[0]['lr']
+
     def reset_optimizer(self, learning_rate: float = None):
         """
         Setzt den Optimierer mit der aktuellen oder einer neuen Lernrate zurück.
@@ -283,14 +326,14 @@ class TransformerTrainer:
         self.data_loader = data_loader
         print(f"Trainingsdaten-Loader gesetzt. Anzahl der Batches: {len(self.data_loader) if self.data_loader else 0}")
 
-    def train_step(self, input_ids: torch.Tensor, target_ids: torch.Tensor) -> float:
+    def train_step(self, input_ids: torch.Tensor, target_ids: torch.Tensor) -> tuple[float, float, float]:
         """
         Führt einen einzelnen Trainingsschritt durch.
         Args:
             input_ids: Batch von Eingabe-Token-IDs, shape [batch_size, seq_len]
             target_ids: Batch von Ziel-Token-IDs, shape [batch_size, seq_len]
         Returns:
-            Verlustwert für diesen Schritt.
+            Tupel aus (Loss, Perplexity, Accuracy) für diesen Schritt.
         """
         self.model.train()
         self.optimizer.zero_grad()
@@ -305,14 +348,30 @@ class TransformerTrainer:
         # Für die Verlustberechnung müssen wir die Dimensionen anpassen
         # output: [batch_size * seq_len, vocab_size]
         # target_ids: [batch_size * seq_len]
-        loss = self.criterion(output.view(-1, output.size(-1)), target_ids.view(-1))
+        loss = self.criterion(output.reshape(-1, output.size(-1)), target_ids.reshape(-1))
+
+        loss_value = loss.item()
+        with torch.no_grad():
+            predictions = output.argmax(dim=-1)
+            pad_token_id = self.tokenizer.pad_token_id
+            if pad_token_id is not None:
+                mask = target_ids != pad_token_id
+                valid_tokens = mask.sum().item()
+                if valid_tokens > 0:
+                    correct_tokens = (predictions == target_ids) & mask
+                    accuracy = correct_tokens.sum().item() / valid_tokens
+                else:
+                    accuracy = 0.0
+            else:
+                accuracy = (predictions == target_ids).float().mean().item()
+        perplexity = math.exp(min(loss_value, 20.0))
 
         loss.backward()
         # Optional: Gradient Clipping
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.optimizer.step()
 
-        return loss.item()
+        return loss_value, perplexity, accuracy
 
     def train_epoch(self) -> float:
         """
@@ -328,7 +387,7 @@ class TransformerTrainer:
         num_batches = 0
 
         for batch_idx, (input_ids, target_ids) in enumerate(self.data_loader):
-            loss = self.train_step(input_ids, target_ids)
+            loss, _, _ = self.train_step(input_ids, target_ids)
             total_loss += loss
             num_batches += 1
             # Optional: Fortschritt ausgeben
@@ -337,6 +396,19 @@ class TransformerTrainer:
 
         avg_loss = total_loss / num_batches if num_batches > 0 else 0
         return avg_loss
+
+    def train_batches(self) -> Iterator[tuple[float, float, float, float]]:
+        """
+        Iteriert über den aktuellen DataLoader und liefert Metriken je Batch.
+        Returns:
+            Iterator über Tupel (Loss, Perplexity, Accuracy, Learning Rate).
+        """
+        if self.data_loader is None:
+            raise ValueError("Trainingsdaten-Loader wurde nicht gesetzt. Bitte rufen Sie 'set_training_data' auf.")
+
+        for input_ids, target_ids in self.data_loader:
+            loss, perplexity, accuracy = self.train_step(input_ids, target_ids)
+            yield loss, perplexity, accuracy, self.optimizer.param_groups[0]['lr']
 
     def evaluate_step(self, input_ids: torch.Tensor, target_ids: torch.Tensor) -> float:
         """
@@ -353,7 +425,7 @@ class TransformerTrainer:
 
         with torch.no_grad():
             output = self.model(input_ids)
-            loss = self.criterion(output.view(-1, output.size(-1)), target_ids.view(-1))
+            loss = self.criterion(output.reshape(-1, output.size(-1)), target_ids.reshape(-1))
         return loss.item()
 
     def save_model(self, path: str):
@@ -403,12 +475,6 @@ class TransformerTrainer:
         current_input_ids = prompt_ids.to(self.device)
 
         for _ in range(max_new_tokens):
-            # Beschränke die Eingabesequenz auf die maximale Sequenzlänge des Modells
-            # Dies ist wichtig, da PositionalEncoding eine feste max_len hat
-            max_model_seq_len = self.model.pos_encoder.pe.size(0)
-            if current_input_ids.size(1) > max_model_seq_len:
-                current_input_ids = current_input_ids[:, -max_model_seq_len:]
-
             with torch.no_grad():
                 output = self.model(current_input_ids) # [1, current_seq_len, vocab_size]
 

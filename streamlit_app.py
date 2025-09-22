@@ -140,11 +140,11 @@ def _create_adapter(metric_queue: queue.Queue) -> InstrumentedBookAdapter:
 
     # Übergabe aller benötigten Parameter an den InstrumentedBookAdapter
     adapter = InstrumentedBookAdapter(
-        model=model,
+        transformer_core=model,
+        tokenizer=tokenizer,
         optimizer=optimizer,
         criterion=criterion,
         device=st.session_state.device,
-        tokenizer=tokenizer
     )
     adapter.clear_metric_callbacks()
 
@@ -152,8 +152,8 @@ def _create_adapter(metric_queue: queue.Queue) -> InstrumentedBookAdapter:
         metric_queue.put(snapshot)
 
     adapter.add_metric_callback(_emit)
-    st.session_state.transformer_core = model # Speichern des Modells
-    st.session_state.tokenizer = tokenizer # Speichern des Tokenizers
+    st.session_state.transformer_core = adapter.transformer_core # Speichern des Modells
+    st.session_state.tokenizer = adapter.tokenizer # Speichern des Tokenizers
     st.session_state.adapter = adapter
     return adapter
 
@@ -165,7 +165,7 @@ def _attach_adapter(adapter: InstrumentedBookAdapter, metric_queue: queue.Queue)
         metric_queue.put(snapshot)
 
     adapter.add_metric_callback(_emit)
-    st.session_state.transformer_core = adapter.model # Speichern des Modells
+    st.session_state.transformer_core = adapter.transformer_core # Speichern des Modells
     st.session_state.tokenizer = adapter.tokenizer # Speichern des Tokenizers
     st.session_state.adapter = adapter
 
@@ -187,12 +187,11 @@ def _start_training(text: str, epochs: int, batch_size: int, learning_rate: floa
         status_queue.put({"type": "status", "value": "Training läuft..."})
         try:
             # Aufruf der Transformer-spezifischen Trainingsmethode
-            adapter.train_on_ingested_data( # Korrigierter Methodenname
-                text,
+            adapter.ingest_book(text, reset_state=not append)
+            adapter.train_on_ingested_data(
                 epochs=epochs,
                 batch_size=batch_size,
                 learning_rate=learning_rate,
-                reset_optimizer=not append, # Optimierer nur zurücksetzen, wenn nicht angefügt
             )
             status_queue.put({"type": "status", "value": "Training abgeschlossen"})
         except Exception as exc:  # pragma: no cover - nur zur Anzeige in der UI
@@ -352,7 +351,7 @@ def _render_persistence() -> None:
         st.subheader("Aktuellen Zustand sichern")
         if adapter:
             try:
-                model_bytes = adapter.export_model_state()
+                model_bytes = adapter.export_brain_state()
             except Exception as exc:  # pragma: no cover - Schutz vor Serialisierungsfehlern
                 st.error(f"Export fehlgeschlagen: {exc}")
                 model_bytes = None
@@ -391,9 +390,9 @@ def _render_persistence() -> None:
                         state.status_queue = status_queue
                         # Erstellt einen neuen Adapter mit Standard-Modell/Tokenizer,
                         # dessen Zustand dann überschrieben wird.
-                        adapter = _create_adapter(metrics_queue) 
-                        adapter.import_model_state(data) # Lädt den Zustand in den neuen Adapter
-                        state.transformer_core = adapter.model # Speichern des Modells
+                        adapter = _create_adapter(metrics_queue)
+                        adapter.import_brain_state(data) # Lädt den Zustand in den neuen Adapter
+                        state.transformer_core = adapter.transformer_core # Speichern des Modells
                         state.tokenizer = adapter.tokenizer # Speichern des Tokenizers
                         state.metrics_history = adapter.metrics.as_dicts()
                         state.training_status = "Modell geladen"
