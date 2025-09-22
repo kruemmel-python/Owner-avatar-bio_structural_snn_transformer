@@ -307,13 +307,25 @@ class InstrumentedBookAdapter: # Nicht mehr von adapter_plus.BookAdapter erben
         # torch.save kann bei BytesIO mit dem Zip-Serialisierer in seltenen Fällen
         # mit einer "unexpected pos"-Meldung abbrechen. Wir versuchen daher zuerst
         # den Standardweg und fallen bei Problemen auf das Legacy-Format zurück.
-        buffer = io.BytesIO()
+        class _NonClosingBytesIO(io.BytesIO):
+            def close(self) -> None:  # type: ignore[override]
+                # torch.save() schließt den Stream nach dem Schreiben.
+                # Für BytesIO würde das spätere getvalue() scheitern, daher ignorieren.
+                pass
+
+            def real_close(self) -> None:
+                super().close()
+
+        buffer = _NonClosingBytesIO()
         try:
             tc.torch.save(payload, buffer)
         except RuntimeError:
-            buffer = io.BytesIO()
+            buffer.real_close()
+            buffer = _NonClosingBytesIO()
             tc.torch.save(payload, buffer, _use_new_zipfile_serialization=False)
-        return buffer.getvalue()
+        data = buffer.getvalue()
+        buffer.real_close()
+        return data
 
     def import_brain_state(self, data: bytes) -> None:
         buffer = io.BytesIO(data)
