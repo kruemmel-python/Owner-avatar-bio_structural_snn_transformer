@@ -12,7 +12,6 @@ import argparse
 import csv
 import io
 import os
-import pickle
 import sys
 import time
 from dataclasses import dataclass, field
@@ -295,17 +294,26 @@ class InstrumentedBookAdapter: # Nicht mehr von adapter_plus.BookAdapter erben
             "transformer_state_dict": self.transformer_core.state_dict(),
             "optimizer_state_dict": self.trainer.optimizer.state_dict(),
             "tokenizer_name": self.tokenizer.name, # Speichere den Namen des Tokenizers
-            "metrics": self.metrics,
+            "metrics": {
+                "steps": list(self.metrics.steps),
+                "loss": list(self.metrics.loss),
+                "perplexity": list(self.metrics.perplexity),
+                "accuracy": list(self.metrics.accuracy),
+                "learning_rate": list(self.metrics.learning_rate),
+            },
             "step_counter": self._step_counter,
-            "ingested_text_data": self.ingested_text_data,
+            "ingested_text_data": [list(chunk) for chunk in self.ingested_text_data],
         }
-        return pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
+        buffer = io.BytesIO()
+        tc.torch.save(payload, buffer)
+        return buffer.getvalue()
 
     def import_brain_state(self, data: bytes) -> None:
-        payload = pickle.loads(data)
+        buffer = io.BytesIO(data)
+        payload = tc.torch.load(buffer, map_location=self.device)
         if not isinstance(payload, dict):
             raise ValueError("Ungültiges Gehirnformat: Erwartet Wörterbuch.")
-        
+
         # Laden des Transformer-Modells
         self.transformer_core.load_state_dict(payload.pop("transformer_state_dict", {}))
         
@@ -328,9 +336,23 @@ class InstrumentedBookAdapter: # Nicht mehr von adapter_plus.BookAdapter erben
         self.trainer.model = self.transformer_core
         self.trainer.device = self.device
         
-        self.metrics = payload.pop("metrics", MetricsLogger())
+        metrics_payload = payload.pop("metrics", None)
+        if isinstance(metrics_payload, dict):
+            metrics = MetricsLogger()
+            metrics.steps = list(metrics_payload.get("steps", []))
+            metrics.loss = list(metrics_payload.get("loss", []))
+            metrics.perplexity = list(metrics_payload.get("perplexity", []))
+            metrics.accuracy = list(metrics_payload.get("accuracy", []))
+            metrics.learning_rate = list(metrics_payload.get("learning_rate", []))
+            self.metrics = metrics
+        elif isinstance(metrics_payload, MetricsLogger):
+            # Fallback für ältere Speicherstände
+            self.metrics = metrics_payload
+        else:
+            self.metrics = MetricsLogger()
         self._step_counter = int(payload.pop("step_counter", 0))
-        self.ingested_text_data = payload.pop("ingested_text_data", [])
+        ingested_payload = payload.pop("ingested_text_data", [])
+        self.ingested_text_data = [list(chunk) for chunk in ingested_payload]
 
         # Falls importierte Metriken leer sind, aktuellen Zustand loggen, damit UI Werte hat.
         if not self.metrics.steps:
